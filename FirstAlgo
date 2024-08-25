@@ -1,0 +1,297 @@
+from __future__ import print_function
+from unigram import Rule as R, generate
+import random
+import re
+import numpy as np
+from problog.program import PrologString
+from problog.core import ProbLog
+from problog import get_evaluatable
+
+from pgmpy.base import DAG
+from pgmpy.models import BayesianNetwork
+from pgmpy.factors.discrete.CPD import TabularCPD
+from pgmpy.inference import VariableElimination
+
+
+import sys
+import threading
+from time import sleep
+try:
+  import thread
+except ImportError:
+  import _thread as thread
+
+try: # use code that works the same in Python 2 and 3
+  range, _print = xrange, print
+  def print(*args, **kwargs):
+    flush = kwargs.pop('flush', False)
+    _print(*args, **kwargs)
+    if flush:
+      kwargs.get('file', sys.stdout).flush()
+except NameError:
+  pass
+
+
+
+def cdquit(fn_name):
+  # print to stderr, unbuffered in Python 2.
+  print('{0} took too long'.format(fn_name), file=sys.stderr)
+  sys.stderr.flush() # Python 3 stderr is likely buffered.
+  thread.interrupt_main() # raises KeyboardInterrupt
+
+def exit_after(s):
+  '''
+  use as decorator to exit process if
+  function takes longer than s seconds
+  '''
+  def outer(fn):
+    def inner(*args, **kwargs):
+      timer = threading.Timer(s, cdquit, args=[fn.__name__])
+      timer.start()
+      try:
+        result = fn(*args, **kwargs)
+      finally:
+        timer.cancel()
+      return result
+    return inner
+  return outer
+
+
+depth = 100
+
+l = ['ù'*(i+1) for i in range(depth*10)]
+
+def custom_render(x):
+  if not 'counter' in x.root.state:
+    x.root.state['counter'] = 0
+    return l[0]
+
+  x.root.state['counter'] += 1
+  return l[x.root.state['counter']//2]
+
+def custom_given_renderer(x):
+  if not 'counter' in x.root.state:
+    #print('lo')
+    x.root.state['counter'] = 0
+    return f'given(exactly(rel($prop{0}, $groupName), $groupName, '+x@pl+')).', f'$propPercent{0} percents of $memberName s are '+x@eng
+
+  x.root.state['counter'] += 1
+  return f'given(exactly(rel($prop{x.root.state['counter']}, $groupName), $groupName, '+x@pl+')).', f'$propPercent{x.root.state['counter']} percents of $memberName s are '+x@eng
+
+def custom_given_renderer2(x,y):
+  if not 'counter' in x.root.state:
+    #print('lo')
+    x.root.state['counter'] = 0
+    return 'given(exactly(rel($prop0, $groupName, '+y@pl+'), $groupName, '+x@pl+')).', '$propPercent0 percents of $memberName s who are '+y@eng+' are '+x@eng
+
+  x.root.state['counter'] += 1
+  return f'given(exactly(rel($prop{x.root.state['counter']}, $groupName, '+y@pl+'), $groupName, '+x@pl+')).', f'$propPercent{x.root.state['counter']} percents of $memberName s who are '+y@eng+' are '+x@eng
+
+def custom_constraint(x):
+  if x.depth >= 8  :
+    #print('called')
+    return False
+  return True
+
+def custom_color_constraint(x):
+  if 'used' in x[0].root.state and not x[0].type in x[0].root.state['used']:
+    return False
+  if not 'use' in x[0].root.state:
+    x[0].root.state['use'] = {x[0].type: True}
+  else:
+    x[0].root.state['use'][x[0].type] = True
+  return True
+
+def color_uptdate_constraint(x):
+  x[0].root.state['used'] = x[0].root.state['use']
+  return True
+
+def custom_and_constraint(x):
+  c = 0
+  #print('triggered')
+  for y in x[0].ancestors:
+    if y.type == 'and':
+      c += 1
+  if c > 2:
+    #print('successfully')
+    return False
+  return True
+#def custom_probability_renderer(x):
+
+def gen_properties_eng():
+  print('property(color, [blue, red, white, green, black, orange]).')
+  print('property(emotion, [happy, sad, angry]).')
+  print('property(clothes, [wearing_shoes, wearing_glasses, wearing_a_shirt]).')
+
+pl, eng = langs = ['pl','eng']
+R.init(langs,"prolog")
+
+R('start(model)','0')
+R('model(setup,take,question)','0\n1\n2\n')
+#R('model(setup,actions,observations,question)','0\n1\n2\n3')
+#Il y au moins un s_componentsize($groupName, $groupSize).\n
+R('setup(s_component)', 'group($groupName).\nsize($groupName, $groupSize).\n0', 'Let $groupName a set of $groupSize $memberName.\n\n0')
+R('s_component(s_line,s_component)', '0 \n1', state_constraint=custom_constraint)
+#Si on est la c'est que c'est la dernière ligne du setup
+R('s_component(s_line)', '0\n')
+R('s_line(given)', '0')
+#$prop = proportion
+#property_v_e property value expression
+#R('given(property_v_e)', 'given(exactly(rel($prop, $groupName), $groupName, 0))',
+#  '$propPercent  percents of $memberName s are 0')
+R('given(property_v_e)', lambda x:custom_given_renderer(x)[0], lambda x:custom_given_renderer(x)[1])
+R('given(property_v_e,property_v_e)',lambda x,y:custom_given_renderer2(x,y)[0], lambda x,y:custom_given_renderer2(x,y)[1])
+
+#vaut mieux faire property avant given si pas access à la génération
+#sinon pas de ligne de property et on rajoute au moment du render
+R('property_v_e(and)', '0')
+R('property_v_e(or)', '0')
+R('property_v_e(not)', '0')
+R('and(property_v_e,property_v_e)', 'and(0, 1)', '0 and 1', constraint=custom_and_constraint)
+R('or(property_v_e,property_v_e)', 'or(0, 1)', '0 or 1')
+R('not(property_v_e)', 'not(0)', 'not 0')
+
+R('actions', '')
+R('observations', '')
+
+#useless but gives clarity
+R('question(constraint)', 'probability(0).','What is the probality that 0 ?', constraint=color_uptdate_constraint)
+
+R('constraint(some)', '0')
+R('constraint(exactly)', '0')
+R('constraint(atleast)', '0')
+R('constraint(atmost)', '0')
+R('constraint(lessthan)', '0')
+R('constraint(morethan)', '0')
+
+R('some(property_v_e)','some($groupNameBis, 0)', 'at least one $memberName is 0')
+R('exactly(property_v_e)', 'exactly($count, $groupNameBis, 0)', 'exactly $count $memberName s are 0')
+R('atleast(property_v_e)', 'atleast($count, $groupNameBis, 0)', 'at least $count $memberName are 0')
+R('atmost(property_v_e)', 'atmost($count, $groupNameBis, 0)', 'at most $count $memberName are 0')
+R('lessthan(property_v_e)', 'less_than($count, $groupNameBis, 0)', 'less than $count $memberName are 0')
+R('morethan(property_v_e)', 'more_than($count, $groupNameBis, 0)', 'more than $count $memberName are 0')
+
+
+R('take', 'take($groupName, $groupNameBis, $countBis).', 'Let\'s pick $countBis $memberName from $groupName.')
+
+def test_constraint(x):
+  print(x[0].type)
+  return True
+
+l = ['blue', 'red','white' ,'green' ,'black', 'orange']
+
+for e in l :
+  R('property_v_e('+e+')', '0', constraint=custom_color_constraint)
+  R(e, e)
+
+l = ['happy', 'sad','angry']
+for e in l :
+  R('property_v_e('+e+')', '0', constraint=custom_color_constraint)
+  R(e, e)
+
+l = ['wearing_glasses', 'wearing_shoes','wearing_a_shirt']
+for e in l :
+  R('property_v_e('+e+')', '0', constraint=custom_color_constraint)
+  R(e, e)
+
+numbers = [2,4,6,12,24,36,48,60,120,180,240,360]
+
+def gen():
+  c = 100
+  tab = []
+  while len(tab) < c:
+    x=generate(R.start(), depth=depth)
+    if len(x):
+      print(x[0]@eng)
+      s = ''
+      s += ':- use_module(library(nlp4plp)).\n\n'
+      s += replace_tag(x[0]@pl)
+      s += 'property(color, [blue, red, white, green, black, orange]).\n'
+      s += 'property(emotion, [happy, sad, angry]).\n'
+      s += 'property(clothes, [wearing_shoes, wearing_glasses, wearing_a_shirt]).\n'
+      #print(list(x[0].state['used'].keys()))
+      r = ''
+      print(s)
+      try:
+         r = ask_problog(s)
+      except:
+        continue
+      s = '<--------------------[Problem '+ str(len(tab)) +']-------------------->\n' + s
+      s += '=================================================================\n'
+      a = list(r.values())[0]
+      if(a == 0):
+        continue
+      print(list(r.values())[0])
+      s += str(a)
+      s +='\n'
+      s += '=================================================================\n'
+      tab.append(s)
+  return tab
+
+
+def replace_tag(s):
+  a = s.replace('$countBis', str(5)).replace('$count', str(2)).replace('$groupSize', str(25))
+  for i in range(100,0, -1):
+    a = a.replace(f'$prop{i}',str(random.random()))
+  a = a.replace(r'$','')
+  return a
+
+@exit_after(3  )
+def ask_problog(s):
+  p = PrologString(s)
+  return get_evaluatable().create_from(p).evaluate()
+
+result = gen()
+s= result[0]
+print('finished generating')
+f = open("result.txt", "w")
+for st in result:
+  f.write(st)
+f.close()
+
+print(s)
+  #s.replace(f'$groupSize',f'{random.randInt}')
+#print(ask_problog(s))
+
+
+
+#R('property_v_e', properties.gen_property(1, 0.6))
+
+
+#wrappper nombre dans accoladdes peut utiliser template
+class Properties:
+
+  def __init__(self) :
+    self.properties = []
+
+  # alpha proba de creer une nouvelle pve
+  # beta probabilité de créer un nouvelle propriété sachant que l'on cree une nouvelle pve
+  # les pve sont reconnue par un double indice : celui de leur proprieté et le rang dedans
+  def gen_property(self, alpha = 0, beta = 0.5):
+    if random.random() < alpha :
+      index = len(self.properties)-1
+      if(random.random() < beta):
+        self.properties.append([0])
+        return f"{index}.0"
+      else:
+        #on va rajouter dans une colonne choisie au hasard
+        i = random.randint(0,index)
+
+        self.properties[i] += 1
+        return f"{i}.{self.properties[i]}"
+    else:
+      i = random.randint(0,len(self.properties)-1)
+      j = random.randint(0,self.properties[i])
+      #est ce que le render est call avant ou apres le replace des chiffre ?
+      #on va supposer pour l'instant que c'est après car ça nous arrange et puis on verra bien
+      return f"${i}.{j}"
+
+
+
+#def customGivenRender(x):
+ # return 'given(exactly(rel($prop, $groupName), $groupName,' + f"{float(x@eng) *100"
+
+
+
+#pour le render il faudrai un truc custom qui remplace les inconnue par des vrai nombre
+
